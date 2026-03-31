@@ -111,5 +111,7 @@ const styles = {
   content: {
     flex: 1, overflow: 'auto', padding: '24px',
     background: '#0d1018',
+
+    
   },
 };
