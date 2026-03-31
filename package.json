@@ -1,0 +1,10 @@
+{
+  "name": "sca-auction",
+  "version": "1.0.0",
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../client && npm install",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "start": "cd backend && npm start"
+  }
+}
