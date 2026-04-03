@@ -1,18 +1,25 @@
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
 const AuctionState = require('../models/AuctionState');
-const Player = require('../models/Player');
-const Team = require('../models/Team');
-const Category = require('../models/Category');
+const Player       = require('../models/Player');
+const Team         = require('../models/Team');
+const Category     = require('../models/Category');
 
-// Helper: get or create singleton auction state
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function getState() {
   let state = await AuctionState.findOne({ singleton: 'global' })
-    .populate({ path: 'currentPlayer', populate: { path: 'category', select: 'name basePrice increment color order' } })
+    .populate({
+      path: 'currentPlayer',
+      populate: { path: 'category', select: 'name basePrice increment color order' },
+    })
     .populate('currentTeam', 'name color')
-    .populate('wcTeam', 'name color')
-    .populate('wcPlayer', 'name role category')
-    .populate('rtmTeam', 'name color');
+    .populate('wcTeam',      'name color')
+    .populate('wcPlayer',    'name role category')
+    .populate('rtmTeam',     'name color');
+
   if (!state) {
     state = new AuctionState({ singleton: 'global' });
     await state.save();
@@ -20,7 +27,6 @@ async function getState() {
   return state;
 }
 
-// Helper: emit full state
 async function emitState(io) {
   const state = await getState();
   const teams = await Team.find()
@@ -29,28 +35,74 @@ async function emitState(io) {
   io.emit('auction:update', { state, teams });
 }
 
-// Helper: get categories sorted by order
 async function getCategories() {
-  const categories = await Category.find().sort({ order: 1 });
+  const cats = await Category.find().sort({ order: 1 });
   return {
-    platCat:    categories.find(c => c.order === 1),
-    diamondCat: categories.find(c => c.order === 2),
-    goldCat:    categories.find(c => c.order === 3),
+    platCat:    cats.find(c => c.order === 1),
+    diamondCat: cats.find(c => c.order === 2),
+    goldCat:    cats.find(c => c.order === 3),
   };
 }
 
-// Helper: build queue for a given round phase + round number
-// Round 1: plat → diamond → gold
-// Round 2+: diamond → gold (plat skipped, demoted plats enter diamond pool)
+// ─────────────────────────────────────────────────────────────────────────────
+// SLOT HELPERS
+// All slot logic reads from team fields — zero hardcoding.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Returns true if a team has filled all slots for a given category phase
+function isSlotFull(team, phase) {
+  if (phase === 'plat')    return team.platSlotsFilled    >= team.maxPlatSlots;
+  if (phase === 'diamond') return team.diamondSlotsFilled >= team.maxDiamondSlots;
+  if (phase === 'gold')    return team.goldSlotsFilled    >= team.maxGoldSlots;
+  return false;
+}
+
+// Maps a roundPhase to its base category name for slot checks
+function phaseToCategory(roundPhase, playerCategoryOrder) {
+  if (roundPhase === 'plat')    return 'plat';
+  if (roundPhase === 'diamond') return 'diamond';
+  if (roundPhase === 'gold')    return 'gold';
+
+  // Wildcard phases: slot is determined by the player's own category
+  if (roundPhase === 'wildcard-plat' || roundPhase === 'wildcard-diamond') {
+    if (playerCategoryOrder === 1) return 'plat';
+    if (playerCategoryOrder === 2) return 'diamond';
+    if (playerCategoryOrder === 3) return 'gold';
+  }
+  return null;
+}
+
+// Returns an error string if the team cannot buy this player, or null if OK
+function checkSlotAvailability(team, player, roundPhase) {
+  const catPhase = phaseToCategory(roundPhase, player.category?.order);
+  if (!catPhase) return 'Unknown phase';
+
+  if (isSlotFull(team, catPhase)) {
+    const max =
+      catPhase === 'plat'    ? team.maxPlatSlots    :
+      catPhase === 'diamond' ? team.maxDiamondSlots :
+                               team.maxGoldSlots;
+    const label = catPhase.charAt(0).toUpperCase() + catPhase.slice(1);
+    return `${team.name} has already filled all ${max} ${label} slot(s) this round`;
+  }
+  return null;
+}
+
+// Increments the correct slot counter on a team document (does NOT save)
+function incrementSlot(team, catPhase) {
+  if (catPhase === 'plat')    team.platSlotsFilled    += 1;
+  if (catPhase === 'diamond') team.diamondSlotsFilled += 1;
+  if (catPhase === 'gold')    team.goldSlotsFilled    += 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUILD QUEUE
+// ─────────────────────────────────────────────────────────────────────────────
 async function buildQueue(roundPhase, roundNumber) {
   const { platCat, diamondCat, goldCat } = await getCategories();
   let players = [];
 
   if (roundPhase === 'plat') {
-    // ALL pending platinum players go into the queue.
-    // The 1-per-team slot limit is enforced during bidding via checkSlotAvailability.
-    // Once all teams fill their plat slot, remaining plat players go unsold
-    // and get demoted to diamond at the end of this phase.
     players = await Player.find({
       originalCategory: platCat._id,
       isCapt: false,
@@ -59,21 +111,16 @@ async function buildQueue(roundPhase, roundNumber) {
 
   } else if (roundPhase === 'diamond') {
     if (roundNumber === 1) {
-      // Round 1: original diamonds only — demoted plats do NOT appear yet
       players = await Player.find({
         originalCategory: diamondCat._id,
         isCapt: false,
         status: 'pending',
       });
     } else {
-      // Round 2+: original diamonds (pending/unsold) + demoted plats eligible this round
       players = await Player.find({
         isCapt: false,
         $or: [
-          {
-            originalCategory: diamondCat._id,
-            status: { $in: ['pending', 'unsold'] },
-          },
+          { originalCategory: diamondCat._id, status: { $in: ['pending', 'unsold'] } },
           {
             originalCategory: platCat._id,
             status: 'unsold',
@@ -92,7 +139,6 @@ async function buildQueue(roundPhase, roundNumber) {
         status: 'pending',
       });
     } else {
-      // Round 2+: pending + unsold golds
       players = await Player.find({
         originalCategory: goldCat._id,
         isCapt: false,
@@ -101,7 +147,7 @@ async function buildQueue(roundPhase, roundNumber) {
     }
   }
 
-  // Shuffle
+  // Fisher-Yates shuffle
   for (let i = players.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [players[i], players[j]] = [players[j], players[i]];
@@ -109,25 +155,21 @@ async function buildQueue(roundPhase, roundNumber) {
   return players.map(p => p._id);
 }
 
-// Helper: determine next phase
-// Round 1 sequence: wildcard-plat → plat → wildcard-diamond → diamond → gold
-// Round 2+ sequence: wildcard-diamond → diamond → gold (no plat)
-// After gold: check if more players remain → next round, else complete
+// ─────────────────────────────────────────────────────────────────────────────
+// DETERMINE NEXT PHASE
+// ─────────────────────────────────────────────────────────────────────────────
 async function determineNextPhase(currentPhase, currentRound) {
   const { platCat, diamondCat, goldCat } = await getCategories();
 
   const sequenceR1 = ['wildcard-plat', 'plat', 'wildcard-diamond', 'diamond', 'gold'];
   const sequenceR2 = ['wildcard-diamond', 'diamond', 'gold'];
+  const sequence   = currentRound === 1 ? sequenceR1 : sequenceR2;
+  const idx        = sequence.indexOf(currentPhase);
 
-  const sequence = currentRound === 1 ? sequenceR1 : sequenceR2;
-  const idx = sequence.indexOf(currentPhase);
-
-  // More phases left in this round
   if (idx !== -1 && idx < sequence.length - 1) {
     return { phase: sequence[idx + 1], round: currentRound };
   }
 
-  // End of round — check if next round needed
   const nextRound = currentRound + 1;
 
   const unsoldDiamond = await Player.countDocuments({
@@ -150,15 +192,15 @@ async function determineNextPhase(currentPhase, currentRound) {
   });
 
   if (unsoldDiamond > 0 || unsoldGold > 0) {
-    // Round 2+ starts at wildcard-diamond, no plat phase
     return { phase: 'wildcard-diamond', round: nextRound };
   }
 
   return { phase: 'complete', round: currentRound };
 }
 
-// Helper: demote unsold platinum players at end of plat phase
-// Sets roundEligible = currentRound + 1 so they only appear in the NEXT round's diamond pool
+// ─────────────────────────────────────────────────────────────────────────────
+// DEMOTE UNSOLD PLATINUMS
+// ─────────────────────────────────────────────────────────────────────────────
 async function demoteUnsoldPlatinums(currentRound) {
   const { platCat, diamondCat } = await getCategories();
 
@@ -166,34 +208,92 @@ async function demoteUnsoldPlatinums(currentRound) {
     originalCategory: platCat._id,
     isCapt: false,
     status: 'unsold',
-    demotionCount: 0,
   });
 
   for (const p of unsoldPlats) {
-    p.category = diamondCat._id;
-    p.basePrice = diamondCat.basePrice;
-    p.status = 'unsold';             // stays unsold; re-enters pool next round
-    p.demotionCount = 1;
-    p.roundEligible = currentRound + 1; // key: only eligible from next round onwards
+    p.category      = diamondCat._id;
+    p.basePrice     = diamondCat.basePrice;
+    p.currentPrice  = 0;
+    p.status        = 'unsold';
+    p.demotionCount = (p.demotionCount || 0) + 1;
+    p.roundEligible = currentRound + 1;
     await p.save();
   }
 
   return unsoldPlats.length;
 }
 
-// Helper: check slot availability for a team bidding on a player
-function checkSlotAvailability(team, player, roundPhase) {
-  if (roundPhase === 'plat' || roundPhase === 'wildcard-plat') {
-    if (team.platSlotFilled) return `${team.name} already has their Platinum player`;
-  } else if (roundPhase === 'diamond' || roundPhase === 'wildcard-diamond') {
-    const maxDiamond = team.maxDiamondSlots || 2;
-    if (team.diamondSlotsFilled >= maxDiamond) return `${team.name} already has ${maxDiamond} Diamond players`;
-  } else if (roundPhase === 'gold') {
-    const maxGold = team.maxGoldSlots || 3;
-    if (team.goldSlotsFilled >= maxGold) return `${team.name} already has ${maxGold} Gold players`;
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE COMPLETION CHECK + AUTO-ADVANCE
+// A phase is complete when every team has EITHER bought OR has no slots left.
+// ─────────────────────────────────────────────────────────────────────────────
+async function checkAndAutoAdvancePhase(io, state) {
+  if (!['plat', 'diamond', 'gold'].includes(state.roundPhase)) return;
+
+  const teams     = await Team.find();
+  const boughtIds = state.teamsBoughtThisPhase.map(id => id.toString());
+
+  const allDone = teams.every(team => {
+    if (boughtIds.includes(team._id.toString())) return true;
+    return isSlotFull(team, state.roundPhase);
+  });
+
+  if (allDone) {
+    console.log(`[AUTO-ADVANCE] All teams done in "${state.roundPhase}" phase — advancing`);
+    await advancePhase(io, state);
   }
-  return null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADVANCE PHASE (shared by auto-advance + manual /advance-round endpoint)
+// ─────────────────────────────────────────────────────────────────────────────
+async function advancePhase(io, state) {
+  if (state.roundPhase === 'plat' && state.roundNumber === 1) {
+    const demoted = await demoteUnsoldPlatinums(state.roundNumber);
+    console.log(`Demoted ${demoted} platinum → diamond (eligible from Round ${state.roundNumber + 1})`);
+  }
+
+  const next = await determineNextPhase(state.roundPhase, state.roundNumber);
+
+  if (next.phase === 'complete') {
+    state.roundPhase    = 'complete';
+    state.status        = 'complete';
+    state.currentPlayer = null;
+    await state.save();
+    await emitState(io);
+    io.emit('auction:phase-complete', { message: 'Auction complete!' });
+    return;
+  }
+
+  const queue = await buildQueue(next.phase, next.round);
+
+  state.roundPhase           = next.phase;
+  state.roundNumber          = next.round;
+  state.currentQueue         = queue;
+  state.queueIndex           = 0;
+  state.currentPlayer        = null;
+  state.currentBid           = 0;
+  state.currentTeam          = null;
+  state.status               = 'idle';
+  state.wcActive             = false;
+  state.wcTeam               = null;
+  state.wcPlayer             = null;
+  state.rtmPending           = false;
+  state.bidHistory           = [];
+  state.teamsBoughtThisPhase = [];    // reset per-phase tracker
+  await state.save();
+
+  await emitState(io);
+  io.emit('auction:phase-advanced', {
+    phase:     next.phase,
+    round:     next.round,
+    queueSize: queue.length,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
 
 // GET /api/auction/state
 router.get('/state', async (req, res) => {
@@ -208,26 +308,27 @@ router.get('/state', async (req, res) => {
   }
 });
 
-// POST /api/auction/init-rounds — Admin starts the auction (sets up R1)
+// POST /api/auction/init-rounds
 router.post('/init-rounds', async (req, res) => {
   try {
     let state = await AuctionState.findOne({ singleton: 'global' });
     if (!state) state = new AuctionState({ singleton: 'global' });
 
-    state.roundPhase = 'wildcard-plat';
-    state.roundNumber = 1;
-    state.status = 'idle';
-    state.currentPlayer = null;
-    state.currentBid = 0;
-    state.currentTeam = null;
-    state.wcActive = false;
-    state.wcTeam = null;
-    state.wcPlayer = null;
-    state.rtmPending = false;
-    state.rtmTeam = null;
-    state.currentQueue = [];
-    state.queueIndex = 0;
-    state.bidHistory = [];
+    state.roundPhase           = 'wildcard-plat';
+    state.roundNumber          = 1;
+    state.status               = 'idle';
+    state.currentPlayer        = null;
+    state.currentBid           = 0;
+    state.currentTeam          = null;
+    state.wcActive             = false;
+    state.wcTeam               = null;
+    state.wcPlayer             = null;
+    state.rtmPending           = false;
+    state.rtmTeam              = null;
+    state.currentQueue         = [];
+    state.queueIndex           = 0;
+    state.bidHistory           = [];
+    state.teamsBoughtThisPhase = [];
     await state.save();
 
     await emitState(req.io);
@@ -237,54 +338,18 @@ router.post('/init-rounds', async (req, res) => {
   }
 });
 
-// POST /api/auction/advance-round — Admin manually advances to next round/phase
+// POST /api/auction/advance-round — admin manually forces phase advance
 router.post('/advance-round', async (req, res) => {
   try {
-    let state = await AuctionState.findOne({ singleton: 'global' });
-
-    // End of plat phase in Round 1: demote unsold platinums
-    // They get roundEligible = 2, so they only appear in Round 2's diamond pool
-    if (state.roundPhase === 'plat' && state.roundNumber === 1) {
-      const demoted = await demoteUnsoldPlatinums(state.roundNumber);
-      console.log(`Demoted ${demoted} platinum players → Diamond pool (eligible from Round ${state.roundNumber + 1})`);
-    }
-
-    const next = await determineNextPhase(state.roundPhase, state.roundNumber);
-
-    if (next.phase === 'complete') {
-      state.roundPhase = 'complete';
-      state.status = 'complete';
-      state.currentPlayer = null;
-      await state.save();
-      await emitState(req.io);
-      return res.json({ message: 'Auction complete!' });
-    }
-
-    const queue = await buildQueue(next.phase, next.round);
-
-    state.roundPhase = next.phase;
-    state.roundNumber = next.round;
-    state.currentQueue = queue;
-    state.queueIndex = 0;
-    state.currentPlayer = null;
-    state.currentBid = 0;
-    state.currentTeam = null;
-    state.status = 'idle';
-    state.wcActive = false;
-    state.wcTeam = null;
-    state.wcPlayer = null;
-    state.rtmPending = false;
-    state.bidHistory = [];
-    await state.save();
-
-    await emitState(req.io);
-    res.json({ message: `Advanced to ${next.phase} (Round ${next.round})`, queue: queue.length });
+    const state = await AuctionState.findOne({ singleton: 'global' });
+    await advancePhase(req.io, state);
+    res.json({ message: `Advanced to ${state.roundPhase} (Round ${state.roundNumber})` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/auction/start-player — Admin picks the next player from queue to auction
+// POST /api/auction/start-player
 router.post('/start-player', async (req, res) => {
   try {
     const { playerId } = req.body;
@@ -303,16 +368,16 @@ router.post('/start-player', async (req, res) => {
 
     if (!player) return res.status(404).json({ error: 'Player not found' });
 
-    player.status = 'live';
+    player.status       = 'live';
     player.currentPrice = player.basePrice;
     await player.save();
 
     state.currentPlayer = player._id;
-    state.currentBid = player.basePrice;
-    state.currentTeam = null;
-    state.status = 'live';
-    state.timerActive = true;
-    state.bidHistory = [];
+    state.currentBid    = player.basePrice;
+    state.currentTeam   = null;
+    state.status        = 'live';
+    state.timerActive   = true;
+    state.bidHistory    = [];
     await state.save();
 
     await emitState(req.io);
@@ -322,31 +387,50 @@ router.post('/start-player', async (req, res) => {
   }
 });
 
-// POST /api/auction/bid — Team places bid
+// POST /api/auction/bid
 router.post('/bid', async (req, res) => {
   try {
     const { teamId } = req.body;
     let state = await AuctionState.findOne({ singleton: 'global' })
       .populate({ path: 'currentPlayer', populate: { path: 'category' } });
 
-    if (state.status !== 'live') return res.status(400).json({ error: 'No active auction' });
-    if (!state.currentPlayer) return res.status(400).json({ error: 'No player being auctioned' });
+    if (state.status !== 'live')  return res.status(400).json({ error: 'No active auction' });
+    if (!state.currentPlayer)     return res.status(400).json({ error: 'No player being auctioned' });
 
     const team = await Team.findById(teamId);
     if (!team) return res.status(404).json({ error: 'Team not found' });
 
-    const player = state.currentPlayer;
-    const category = player.category;
-    const newBid = state.currentBid + category.increment;
+    // Increment from the ROUND's category, not the player's own category
+    const { platCat, diamondCat, goldCat } = await getCategories();
+    let roundCat;
+    if      (state.roundPhase === 'plat'    || state.roundPhase === 'wildcard-plat')    roundCat = platCat;
+    else if (state.roundPhase === 'diamond' || state.roundPhase === 'wildcard-diamond') roundCat = diamondCat;
+    else                                                                                 roundCat = goldCat;
+
+    const newBid = state.currentBid + roundCat.increment;
 
     if (team.purseRemaining < newBid) {
-      return res.status(400).json({ error: `Insufficient purse. ${team.name} has ${team.purseRemaining} pts, bid requires ${newBid}` });
+      return res.status(400).json({
+        error: `Insufficient purse. ${team.name} has ${team.purseRemaining} pts, bid requires ${newBid}`,
+      });
     }
 
-    const slotError = checkSlotAvailability(team, player, state.roundPhase);
+    const slotError = checkSlotAvailability(team, state.currentPlayer, state.roundPhase);
     if (slotError) return res.status(400).json({ error: slotError });
 
-    state.currentBid = newBid;
+    // Enforce 1-per-team-per-phase for non-wildcard phases
+    if (['plat', 'diamond', 'gold'].includes(state.roundPhase)) {
+      const alreadyBought = state.teamsBoughtThisPhase.some(
+        id => id.toString() === teamId.toString()
+      );
+      if (alreadyBought) {
+        return res.status(400).json({
+          error: `${team.name} has already bought a player in this ${state.roundPhase} phase`,
+        });
+      }
+    }
+
+    state.currentBid  = newBid;
     state.currentTeam = teamId;
     state.timerActive = true;
     state.bidHistory.push({ team: teamId, amount: newBid });
@@ -354,14 +438,13 @@ router.post('/bid', async (req, res) => {
 
     await emitState(req.io);
     req.io.emit('auction:bid', { team: team.name, amount: newBid });
-
     res.json({ message: 'Bid placed', newBid });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/auction/sold — Admin marks current player as SOLD
+// POST /api/auction/sold
 router.post('/sold', async (req, res) => {
   try {
     let state = await AuctionState.findOne({ singleton: 'global' })
@@ -372,71 +455,96 @@ router.post('/sold', async (req, res) => {
     }
 
     const player = await Player.findById(state.currentPlayer._id).populate('category');
-    const team = await Team.findById(state.currentTeam);
+    const team   = await Team.findById(state.currentTeam);
 
     team.purseRemaining -= state.currentBid;
     team.playersBought.push(player._id);
 
-    const roundPhase = state.roundPhase;
-    if (roundPhase === 'plat' || roundPhase === 'wildcard-plat') {
-      team.platSlotFilled = true;
-    } else if (roundPhase === 'diamond' || roundPhase === 'wildcard-diamond') {
-      team.diamondSlotsFilled += 1;
-    } else if (roundPhase === 'gold') {
-      team.goldSlotsFilled += 1;
+    const phase    = state.roundPhase;
+    const catPhase = phaseToCategory(phase, player.category?.order);
+
+    // Increment slot counter (fully dynamic — reads maxPlatSlots etc.)
+    incrementSlot(team, catPhase);
+
+    // Wildcard — record usage
+    if (phase === 'wildcard-plat' || phase === 'wildcard-diamond') {
+      team.wildCardUsed   = true;
+      team.wildCardPlayer = player._id;
     }
 
     await team.save();
 
-    player.status = 'sold';
-    player.team = team._id;
+    player.status       = 'sold';
+    player.team         = team._id;
     player.currentPrice = state.currentBid;
     await player.save();
 
-    state.status = 'sold';
+    state.status      = 'sold';
     state.timerActive = false;
+
+    // Track team as done in this phase (non-wildcard phases)
+    if (['plat', 'diamond', 'gold'].includes(phase)) {
+      const alreadyTracked = state.teamsBoughtThisPhase.some(
+        id => id.toString() === team._id.toString()
+      );
+      if (!alreadyTracked) state.teamsBoughtThisPhase.push(team._id);
+    }
+
     await state.save();
 
     req.io.emit('player:sold', {
       player: { name: player.name, id: player._id },
-      team: { name: team.name, id: team._id },
-      price: state.currentBid,
+      team:   { name: team.name,   id: team._id   },
+      price:  state.currentBid,
     });
 
     await emitState(req.io);
+
+    // Auto-advance if all teams are done in this phase
+    const freshState = await AuctionState.findOne({ singleton: 'global' });
+    await checkAndAutoAdvancePhase(req.io, freshState);
+
     res.json({ message: `${player.name} SOLD to ${team.name} for ${state.currentBid}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/auction/unsold — Admin marks current player as UNSOLD
+// POST /api/auction/unsold
 router.post('/unsold', async (req, res) => {
   try {
     let state = await AuctionState.findOne({ singleton: 'global' });
-
     if (!state.currentPlayer) return res.status(400).json({ error: 'No active player' });
 
-    const player = await Player.findById(state.currentPlayer);
-    player.status = 'unsold';
+    const player     = await Player.findById(state.currentPlayer).populate('category');
+    const currentCat = await Category.findById(player.category._id);
+
+    // Reset price to their current category's base (handles demoted plats correctly)
+    player.basePrice    = currentCat.basePrice;
     player.currentPrice = 0;
-    player.team = null;
+    player.status       = 'unsold';
+    player.team         = null;
     await player.save();
 
-    state.status = 'unsold';
+    state.status      = 'unsold';
     state.currentTeam = null;
     state.timerActive = false;
     await state.save();
 
     req.io.emit('player:unsold', { player: { name: player.name, id: player._id } });
     await emitState(req.io);
+
+    // Auto-advance check after unsold too
+    const freshState = await AuctionState.findOne({ singleton: 'global' });
+    await checkAndAutoAdvancePhase(req.io, freshState);
+
     res.json({ message: `${player.name} marked as unsold` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/auction/wildcard — Team declares Wild Card on a player (UNCHANGED)
+// POST /api/auction/wildcard
 router.post('/wildcard', async (req, res) => {
   try {
     const { teamId, playerId } = req.body;
@@ -447,52 +555,57 @@ router.post('/wildcard', async (req, res) => {
     }
 
     const team = await Team.findById(teamId);
-    if (!team) return res.status(404).json({ error: 'Team not found' });
+    if (!team)             return res.status(404).json({ error: 'Team not found' });
     if (team.wildCardUsed) return res.status(400).json({ error: `${team.name} has already used their Wild Card` });
 
     const player = await Player.findById(playerId).populate('category');
     if (!player) return res.status(404).json({ error: 'Player not found' });
 
-    if (state.roundPhase === 'wildcard-plat') {
-      if (player.category.order === 1) return res.status(400).json({ error: 'Cannot Wild Card a Platinum player in Platinum round' });
-    } else if (state.roundPhase === 'wildcard-diamond') {
-      if (player.category.order !== 3) return res.status(400).json({ error: 'In Diamond Wild Card round, can only pick Gold players' });
+    if (state.roundPhase === 'wildcard-plat' && player.category.order === 1) {
+      return res.status(400).json({ error: 'Cannot Wild Card a Platinum player in Platinum round' });
+    }
+    if (state.roundPhase === 'wildcard-diamond' && player.category.order !== 3) {
+      return res.status(400).json({ error: 'In Diamond Wild Card round, can only pick Gold players' });
     }
 
-    const categories = await Category.find().sort({ order: 1 });
-    const targetCat = state.roundPhase === 'wildcard-plat'
-      ? categories.find(c => c.order === 1)
-      : categories.find(c => c.order === 2);
+    // Pricing uses the ROUND's category
+    const { platCat, diamondCat } = await getCategories();
+    const targetCat = state.roundPhase === 'wildcard-plat' ? platCat : diamondCat;
 
     player.currentPrice = targetCat.basePrice;
-    player.status = 'live';
+    player.status       = 'live';
     await player.save();
 
-    state.wcActive = true;
-    state.wcTeam = teamId;
-    state.wcPlayer = playerId;
+    state.wcActive      = true;
+    state.wcTeam        = teamId;
+    state.wcPlayer      = playerId;
     state.currentPlayer = playerId;
-    state.currentBid = targetCat.basePrice;
-    state.currentTeam = teamId;
-    state.rtmPending = true;
-    state.status = 'live';
+    state.currentBid    = targetCat.basePrice;
+    state.currentTeam   = teamId;
+    state.rtmPending    = true;
+    state.status        = 'live';
     await state.save();
 
     req.io.emit('auction:wildcard', {
-      team: team.name,
-      player: player.name,
-      basePrice: targetCat.basePrice,
+      team:       team.name,
+      player:     player.name,
+      basePrice:  targetCat.basePrice,
+      increment:  targetCat.increment,
       roundPhase: state.roundPhase,
     });
 
     await emitState(req.io);
-    res.json({ message: `Wild Card declared by ${team.name} on ${player.name}`, basePrice: targetCat.basePrice });
+    res.json({
+      message:   `Wild Card declared by ${team.name} on ${player.name}`,
+      basePrice: targetCat.basePrice,
+      increment: targetCat.increment,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/auction/rtm — Other team uses Right to Match (UNCHANGED)
+// POST /api/auction/rtm
 router.post('/rtm', async (req, res) => {
   try {
     const { teamId } = req.body;
@@ -502,120 +615,113 @@ router.post('/rtm', async (req, res) => {
     if (!state.rtmPending) return res.status(400).json({ error: 'No RTM pending' });
 
     const team = await Team.findById(teamId);
-    const player = state.currentPlayer;
-    const category = player.category;
-    const newBid = state.currentBid + category.increment;
+    if (!team) return res.status(404).json({ error: 'Team not found' });
+
+    // Increment from ROUND's category
+    const { platCat, diamondCat, goldCat } = await getCategories();
+    let roundCat;
+    if      (state.roundPhase === 'wildcard-plat')    roundCat = platCat;
+    else if (state.roundPhase === 'wildcard-diamond') roundCat = diamondCat;
+    else                                              roundCat = goldCat;
+
+    const newBid = state.currentBid + roundCat.increment;
 
     if (team.purseRemaining < newBid) {
-      return res.status(400).json({ error: `Insufficient purse for RTM. ${team.name} has ${team.purseRemaining} pts` });
+      return res.status(400).json({
+        error: `Insufficient purse for RTM. ${team.name} has ${team.purseRemaining} pts`,
+      });
     }
 
-    state.rtmPending = false;
-    state.rtmUsed = true;
-    state.rtmTeam = teamId;
-    state.currentBid = newBid;
+    state.rtmPending  = false;
+    state.rtmUsed     = true;
+    state.rtmTeam     = teamId;
+    state.currentBid  = newBid;
     state.currentTeam = teamId;
     state.bidHistory.push({ team: teamId, amount: newBid });
     await state.save();
 
     req.io.emit('auction:rtm', { team: team.name, amount: newBid });
     await emitState(req.io);
-
     res.json({ message: `RTM used by ${team.name}, new bid: ${newBid}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/auction/skip-wildcard — Admin skips Wild Card round (UNCHANGED)
+// POST /api/auction/skip-wildcard
 router.post('/skip-wildcard', async (req, res) => {
   try {
     let state = await AuctionState.findOne({ singleton: 'global' });
     if (!['wildcard-plat', 'wildcard-diamond'].includes(state.roundPhase)) {
       return res.status(400).json({ error: 'Not in a wildcard phase' });
     }
-
-    const next = await determineNextPhase(state.roundPhase, state.roundNumber);
-
-    if (next.phase === 'complete') {
-      state.roundPhase = 'complete';
-      state.status = 'complete';
-      state.currentPlayer = null;
-      await state.save();
-      await emitState(req.io);
-      return res.json({ message: 'Auction complete!' });
-    }
-
-    const queue = await buildQueue(next.phase, next.round);
-
-    state.roundPhase = next.phase;
-    state.roundNumber = next.round;
-    state.currentQueue = queue;
-    state.queueIndex = 0;
-    state.wcActive = false;
-    state.wcTeam = null;
-    state.wcPlayer = null;
-    state.rtmPending = false;
-    state.status = 'idle';
-    state.currentPlayer = null;
-    state.currentBid = 0;
-    state.currentTeam = null;
-    await state.save();
-
-    await emitState(req.io);
-    res.json({ message: `Skipped to ${next.phase} (Round ${next.round})` });
+    await advancePhase(req.io, state);
+    res.json({ message: `Skipped wildcard — advancing` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/auction/reset — Full reset
+// POST /api/auction/reset
 router.post('/reset', async (req, res) => {
   try {
+    // Reset all non-captain players to their original category and pending status
     const allPlayers = await Player.find({ isCapt: false });
     for (const p of allPlayers) {
-      p.category = p.originalCategory;
-      p.status = 'pending';
-      p.team = null;
+      const origCat  = await Category.findById(p.originalCategory);
+      p.category     = p.originalCategory;
+      p.basePrice    = origCat ? origCat.basePrice : p.basePrice;
+      p.status       = 'pending';
+      p.team         = null;
       p.currentPrice = 0;
       p.demotionCount = 0;
       p.roundEligible = 1;
       await p.save();
     }
 
+    // Reset teams — deduct captain base price from purse
     const teams = await Team.find();
     for (const t of teams) {
-      t.purseRemaining = t.initialPurse;
-      t.playersBought = [];
-      t.wildCardUsed = false;
-      t.wildCardPlayer = null;
-      t.platSlotFilled = false;
+      t.purseRemaining     = t.initialPurse;
+      t.playersBought      = [];
+      t.wildCardUsed       = false;
+      t.wildCardPlayer     = null;
+      t.platSlotsFilled    = 0;
       t.diamondSlotsFilled = 0;
-      t.goldSlotsFilled = 0;
+      t.goldSlotsFilled    = 0;
+
       if (t.captain) {
         const cap = await Player.findById(t.captain);
-        if (cap) t.playersBought = [cap._id];
+        if (cap) {
+          t.playersBought   = [cap._id];
+          t.purseRemaining -= (cap.basePrice || 0);
+        }
       }
       await t.save();
     }
 
-    await AuctionState.findOneAndUpdate({ singleton: 'global' }, {
-      roundPhase: 'idle',
-      roundNumber: 1,
-      status: 'idle',
-      currentPlayer: null,
-      currentBid: 0,
-      currentTeam: null,
-      wcActive: false,
-      wcTeam: null,
-      wcPlayer: null,
-      rtmPending: false,
-      rtmTeam: null,
-      currentQueue: [],
-      queueIndex: 0,
-      bidHistory: [],
-      timerActive: false,
-    });
+    await AuctionState.findOneAndUpdate(
+      { singleton: 'global' },
+      {
+        roundPhase:           'idle',
+        roundNumber:          1,
+        status:               'idle',
+        currentPlayer:        null,
+        currentBid:           0,
+        currentTeam:          null,
+        wcActive:             false,
+        wcTeam:               null,
+        wcPlayer:             null,
+        rtmPending:           false,
+        rtmTeam:              null,
+        currentQueue:         [],
+        queueIndex:           0,
+        bidHistory:           [],
+        timerActive:          false,
+        teamsBoughtThisPhase: [],
+      },
+      { upsert: true }
+    );
 
     req.io.emit('auction:reset');
     await emitState(req.io);
@@ -625,21 +731,23 @@ router.post('/reset', async (req, res) => {
   }
 });
 
-// GET /api/auction/available-players — players available for wildcard picking (UNCHANGED)
+// GET /api/auction/available-players
 router.get('/available-players', async (req, res) => {
   try {
     const state = await AuctionState.findOne({ singleton: 'global' });
     const { diamondCat, goldCat } = await getCategories();
 
-    let query = { status: 'pending', isCapt: false };
+    let query = { isCapt: false, status: { $in: ['pending', 'unsold'] } };
 
     if (state?.roundPhase === 'wildcard-plat') {
+      // Diamond and gold players eligible (includes demoted plats whose category=diamond)
       query.category = { $in: [diamondCat._id, goldCat._id] };
     } else if (state?.roundPhase === 'wildcard-diamond') {
       query.category = goldCat._id;
     }
 
-    const players = await Player.find(query).populate('category', 'name color order basePrice');
+    const players = await Player.find(query)
+      .populate('category', 'name color order basePrice increment');
     res.json(players);
   } catch (err) {
     res.status(500).json({ error: err.message });

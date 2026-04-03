@@ -1,15 +1,9 @@
 const mongoose = require('mongoose');
 
-// ─────────────────────────────────────────────────────────────
-// Team Schema
-// Added maxDiamondSlots / maxGoldSlots so slot limits are
-// configurable per team rather than hardcoded in the route.
-// Defaults match your original rules (3 diamond, 2 gold).
-// ─────────────────────────────────────────────────────────────
 const teamSchema = new mongoose.Schema({
-  name:   { type: String, required: true },
-  color:  { type: String, default: '#3b82f6' },
-  logo:   { type: String },
+  name:  { type: String, required: true },
+  color: { type: String, default: '#3b82f6' },
+  logo:  { type: String },
 
   // Purse
   initialPurse:   { type: Number, default: 0 },
@@ -25,14 +19,16 @@ const teamSchema = new mongoose.Schema({
   wildCardUsed:   { type: Boolean, default: false },
   wildCardPlayer: { type: mongoose.Schema.Types.ObjectId, ref: 'Player', default: null },
 
-  // Slot tracking
-  platSlotFilled:   { type: Boolean, default: false },   // max 1 plat per team
+  // ── Fully dynamic slot maximums — admin sets these per team ──
+  maxPlatSlots:    { type: Number, default: 1 },
+  maxDiamondSlots: { type: Number, default: 2 },
+  maxGoldSlots:    { type: Number, default: 3 },
+
+  // ── Fill counters — all numeric, no more boolean for plat ──
+  platSlotsFilled:    { type: Number, default: 0 },
   diamondSlotsFilled: { type: Number, default: 0 },
   goldSlotsFilled:    { type: Number, default: 0 },
 
-  // Configurable slot maximums
-  maxDiamondSlots: { type: Number, default: 2 },   // adjust per your rules
-  maxGoldSlots:    { type: Number, default: 3 },   // adjust per your rules
 }, { timestamps: true });
 
 module.exports = mongoose.model('Team', teamSchema);
